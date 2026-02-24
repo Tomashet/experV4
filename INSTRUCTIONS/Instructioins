@@ -356,4 +356,12 @@ Colab is typically Python 3.10 right now, so you’re good by default.
 If you run locally, use:
 python --version
 and if needed, create a venv with 3.10.
+#########################
+after everything works run:
+pip freeze > requirements_locked.txt
+That creates an exact environment snapshot for reproducibility in the appendix.
+
+Keep requirements.txt (loose ranges, readable)
+
+Include requirements_locked.txt (exact freeze
 
