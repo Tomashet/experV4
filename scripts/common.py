@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 import gymnasium as gym
-import highway_env  # registers merge-v0 / highway-v0
+import highway_env  # noqa: F401 (register envs)
 
 from src.context import MarkovContextScheduler
 from src.safety import SafetyParams, ConformalCalibrator
@@ -34,24 +34,13 @@ def make_env(
     no_conformal: bool,
     safety_params: SafetyParams,
 ) -> Tuple[gym.Env, Optional[Any], Optional[Any]]:
+
     env_id = _normalize_env_id(env_id)
 
     # 1) Base env
     env = gym.make(env_id, render_mode=None, disable_env_checker=True)
 
-    # --- CRITICAL FIX FOR SAC: set continuous action space BEFORE SB3 builds the model ---
-    if action_space_type.lower() == "continuous":
-        # highway-env supports configuring action type via env.unwrapped.configure
-        if hasattr(env.unwrapped, "configure"):
-            env.unwrapped.configure(
-                {
-                    "action": {"type": "ContinuousAction"}
-                }
-            )
-        else:
-            raise RuntimeError("Env does not support configure(); cannot set ContinuousAction for SAC.")
-
-    # Seed base env deterministically
+    # 2) Seeding
     env.reset(seed=seed)
     try:
         env.action_space.seed(seed)
@@ -59,19 +48,19 @@ def make_env(
     except Exception:
         pass
 
-    # 2) Markov context switching
+    # 3) Markov context switching
     scheduler = MarkovContextScheduler(seed=seed, p_stay=p_stay)
     env = ContextNonstationaryWrapper(env, scheduler=scheduler)
 
-    # 3) Context-dependent observation noise/dropout
+    # 4) Optional observation noise
     env = ObservationNoiseWrapper(env, seed=seed)
 
-    # 4) Optional conformal calibrator
+    # 5) Optional conformal calibrator (FIXED)
     calibrator: Optional[ConformalCalibrator] = None
     if not no_conformal:
-        calibrator = ConformalCalibrator(params=safety_params)
+        calibrator = ConformalCalibrator(alpha=0.1, window=200, seed=seed)
 
-    # 5) Safety shield wrapper
+    # 6) Safety shield wrapper
     env = SafetyShieldWrapper(
         env,
         params=safety_params,
@@ -81,7 +70,12 @@ def make_env(
         calibrator=calibrator,
     )
 
-    # 6) Fix observation tensor shape for SB3 buffers
-    env = FixedKinematicsObsWrapper(env, K=10)
+    # 7) IMPORTANT: keep merge-v0 obs 2D (5x5) so SB3 VecEnv buffers match.
+    # Use K=5 for merge-v0; highway-v0 can be different, but this is safe here.
+    if env_id == "merge-v0":
+        env = FixedKinematicsObsWrapper(env, K=5)
+    else:
+        # For highway-v0, if obs is 1D this wrapper will leave it alone.
+        env = FixedKinematicsObsWrapper(env, K=5)
 
     return env, None, calibrator

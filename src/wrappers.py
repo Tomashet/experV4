@@ -1,241 +1,285 @@
 # src/wrappers.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
-
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import gymnasium as gym
 
-from src.context import MarkovContextScheduler, context_to_highway_config
-from src.safety import SafetyParams, ConformalCalibrator
+from src.safety import SafetyParams, ConformalCalibrator, clearance_margin
+
+
+def _to_np(x: Any) -> np.ndarray:
+    if isinstance(x, np.ndarray):
+        return x
+    return np.array(x)
+
+
+def _pad_trunc_2d(a: np.ndarray, K: int) -> np.ndarray:
+    """
+    Pads/truncates a 2D array to K rows, preserving columns.
+    Returns shape (K, D). IMPORTANT: do NOT flatten for merge-v0.
+    """
+    if a.ndim != 2:
+        return a
+    n, d = a.shape
+    if n == K:
+        return a
+    if n > K:
+        return a[:K]
+    pad = np.zeros((K - n, d), dtype=a.dtype)
+    return np.concatenate([a, pad], axis=0)
+
+
+def _fix_obs(obs: Any, K: int) -> Any:
+    """
+    Makes observation shape stable:
+      - If obs is 2D (N x D): pad/truncate to (K x D) and keep 2D.
+      - If obs is 1D: keep as-is.
+      - If obs is dict: apply to key 'observation' if present, else first array-like.
+    """
+    if isinstance(obs, dict):
+        out = dict(obs)
+        if "observation" in out:
+            out["observation"] = _fix_obs(out["observation"], K)
+            return out
+        for k, v in out.items():
+            if isinstance(v, (np.ndarray, list, tuple)):
+                out[k] = _fix_obs(v, K)
+                break
+        return out
+
+    a = _to_np(obs).astype(np.float32, copy=False)
+    if a.ndim == 2:
+        return _pad_trunc_2d(a, K)
+    return a
 
 
 class ContextNonstationaryWrapper(gym.Wrapper):
     """
-    Applies a Markov context switch once per episode and configures the underlying highway-env.
-    Stores last_config for downstream wrappers (noise/dropout, logging).
-
-    IMPORTANT: attaches ctx_id/ctx_tuple to both reset() AND step() info so step-level
-    logging (SB3 callback) can visualize context switching.
+    Maintains a latent context id driven by a scheduler (e.g., MarkovContextScheduler).
+    Exposes: self.cur_ctx_id (int)
+    Adds to info: info['ctx_id']
     """
 
-    def __init__(self, env: gym.Env, scheduler: MarkovContextScheduler):
+    def __init__(self, env: gym.Env, scheduler: Any):
         super().__init__(env)
         self.scheduler = scheduler
-        self.last_config: Dict[str, Any] = {}
-        self._first_reset = True
+        self.cur_ctx_id: int = 0
 
-        # Current context metadata
-        self._ctx_id: int = -1
-        self._ctx_tuple: Any = None
+    def _scheduler_reset(self) -> int:
+        if hasattr(self.scheduler, "reset"):
+            v = self.scheduler.reset()
+            if v is None and hasattr(self.scheduler, "cur_ctx_id"):
+                v = getattr(self.scheduler, "cur_ctx_id")
+            if v is not None:
+                return int(v)
+        return 0
+
+    def _scheduler_step(self) -> int:
+        if hasattr(self.scheduler, "step"):
+            v = self.scheduler.step()
+            if v is None and hasattr(self.scheduler, "cur_ctx_id"):
+                v = getattr(self.scheduler, "cur_ctx_id")
+            if v is not None:
+                return int(v)
+        return self.cur_ctx_id
 
     def reset(self, **kwargs):
-        # Advance context once per new episode (not on the very first reset)
-        if self._first_reset:
-            ctx = self.scheduler.current()
-            self._first_reset = False
-        else:
-            ctx = self.scheduler.step_episode()
-
-        cfg = context_to_highway_config(ctx)
-        self.last_config = cfg
-        self._ctx_id = int(cfg.get("_ctx_id", -1))
-        self._ctx_tuple = cfg.get("_ctx_tuple", None)
-
-        # Configure underlying env if possible
-        if hasattr(self.env.unwrapped, "configure"):
-            self.env.unwrapped.configure(cfg)
-
         obs, info = self.env.reset(**kwargs)
-
-        # Ensure ctx metadata is visible in info (reset)
-        info = dict(info) if info is not None else {}
-        info["ctx_id"] = self._ctx_id
-        info["ctx_tuple"] = self._ctx_tuple
+        self.cur_ctx_id = self._scheduler_reset()
+        if isinstance(info, dict):
+            info = dict(info)
+            info["ctx_id"] = self.cur_ctx_id
         return obs, info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-
-        # Ensure ctx metadata is visible in info (every step)
-        info = dict(info) if info is not None else {}
-        info["ctx_id"] = self._ctx_id
-        info["ctx_tuple"] = self._ctx_tuple
+        self.cur_ctx_id = self._scheduler_step()
+        if isinstance(info, dict):
+            info = dict(info)
+            info["ctx_id"] = self.cur_ctx_id
         return obs, reward, terminated, truncated, info
 
 
 class ObservationNoiseWrapper(gym.ObservationWrapper):
     """
-    Adds Gaussian noise and/or dropout to observations based on context config keys:
-      - _ctx_obs_noise_std
-      - _ctx_dropout_prob
-
-    This wrapper expects the wrapped env (or another wrapper) to expose .last_config
-    (ContextNonstationaryWrapper provides it).
+    Adds mild Gaussian noise to observations.
+    If env has cur_ctx_id, noise can vary with context id.
     """
 
-    def __init__(self, env: gym.Env, seed: int = 0):
+    def __init__(
+        self,
+        env: gym.Env,
+        seed: int = 0,
+        base_sigma: float = 0.0,
+        ctx_sigma: float = 0.01,
+    ):
         super().__init__(env)
         self.rng = np.random.default_rng(seed)
+        self.base_sigma = float(base_sigma)
+        self.ctx_sigma = float(ctx_sigma)
 
-    def observation(self, observation):
-        obs = np.asarray(observation).astype(np.float32, copy=False)
+    def observation(self, obs):
+        ctx = getattr(self.env, "cur_ctx_id", 0)
+        try:
+            ctx = int(ctx)
+        except Exception:
+            ctx = 0
 
-        cfg = getattr(self.env, "last_config", {}) or {}
-        noise_std = float(cfg.get("_ctx_obs_noise_std", 0.0))
-        dropout_prob = float(cfg.get("_ctx_dropout_prob", 0.0))
+        sigma = self.base_sigma + self.ctx_sigma * max(0, ctx)
+        if sigma <= 0:
+            return obs
 
-        if noise_std > 0:
-            obs = obs + self.rng.normal(0.0, noise_std, size=obs.shape).astype(np.float32)
+        if isinstance(obs, dict):
+            out = dict(obs)
+            if "observation" in out:
+                a = _to_np(out["observation"]).astype(np.float32, copy=False)
+                out["observation"] = a + self.rng.normal(0.0, sigma, size=a.shape).astype(np.float32)
+                return out
+            for k, v in out.items():
+                if isinstance(v, (np.ndarray, list, tuple)):
+                    a = _to_np(v).astype(np.float32, copy=False)
+                    out[k] = a + self.rng.normal(0.0, sigma, size=a.shape).astype(np.float32)
+                    break
+            return out
 
-        if dropout_prob > 0:
-            mask = self.rng.random(obs.shape) < dropout_prob
-            obs = obs.copy()
-            obs[mask] = 0.0
+        a = _to_np(obs).astype(np.float32, copy=False)
+        return a + self.rng.normal(0.0, sigma, size=a.shape).astype(np.float32)
 
-        return obs
+
+class FixedKinematicsObsWrapper(gym.ObservationWrapper):
+    """
+    Ensures stable observation shape for SB3 VecEnv buffers.
+
+    For merge-v0 your observation space is (5,5). SB3 expects that shape,
+    so we keep 2D observations and pad/truncate to (K, D).
+    """
+
+    def __init__(self, env: gym.Env, K: int = 5):
+        super().__init__(env)
+        self.K = int(K)
+
+        # If underlying obs space is 2D Box, update it to (K, D)
+        try:
+            if isinstance(env.observation_space, gym.spaces.Box) and len(env.observation_space.shape) == 2:
+                _, d = env.observation_space.shape
+                low = np.full((self.K, d), np.min(env.observation_space.low), dtype=np.float32)
+                high = np.full((self.K, d), np.max(env.observation_space.high), dtype=np.float32)
+                self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        except Exception:
+            # If we fail to set, SB3 might still work if shapes match anyway.
+            pass
+
+    def observation(self, obs):
+        return _fix_obs(obs, self.K)
 
 
 class SafetyShieldWrapper(gym.Wrapper):
     """
-    Wraps an env with an (optional) safety shield.
+    Filters actions through the MPC-like safety shield defined in src/safety.py.
+    Uses MPCLikeSafetyShield when available.
 
-    IMPORTANT: We deliberately do NOT import a specific 'SafetyShield' class at module import
-    time, because your src/safety.py may use a different class name. Instead, we lazy-import
-    and search for a shield class only when needed.
-
-    If --no_mpc and --no_conformal are both True, this wrapper becomes a pass-through that
-    still logs shield_used/shield_reason fields.
-
-    Also defines a clear safety metric:
-      - violation := crashed/collision from highway-env info (if provided)
+    Adds shield diagnostics to info as:
+      info['shield/<key>'] = value
     """
 
     def __init__(
         self,
         env: gym.Env,
         params: SafetyParams,
-        action_space_type: str,
-        no_mpc: bool,
-        no_conformal: bool,
+        action_space_type: str,  # "discrete"|"continuous"
+        no_mpc: bool = False,
+        no_conformal: bool = False,
         calibrator: Optional[ConformalCalibrator] = None,
     ):
         super().__init__(env)
         self.params = params
-        self.action_space_type = action_space_type
+        self.action_space_type = str(action_space_type)
         self.no_mpc = bool(no_mpc)
         self.no_conformal = bool(no_conformal)
         self.calibrator = calibrator
 
-        self.shield = None
+        import src.safety as s
 
-        # Only try to build a shield if at least one feature is enabled
-        if not (self.no_mpc and self.no_conformal):
-            from src import safety as safety_mod
+        candidates = [
+            "MPCLikeSafetyShield",  # <-- actual class in your src/safety.py
+            "SafetyShield",
+            "Shield",
+            "SafetyLayer",
+            "MPCShield",
+        ]
 
-            # Try common class names (pick first that exists)
-            ShieldCls = (
-                getattr(safety_mod, "SafetyShield", None)
-                or getattr(safety_mod, "Shield", None)
-                or getattr(safety_mod, "SafetyLayer", None)
-                or getattr(safety_mod, "MPCShield", None)
+        shield_cls = None
+        chosen = None
+        for name in candidates:
+            if hasattr(s, name):
+                shield_cls = getattr(s, name)
+                chosen = name
+                break
+
+        if shield_cls is None:
+            raise ImportError(
+                "Could not find a shield class in src/safety.py. Tried: "
+                + ", ".join(candidates)
+                + '. Run: python -c "import src.safety as s; print([n for n in dir(s) if \'hield\' in n.lower()])" '
+                "and then update SafetyShieldWrapper to use the correct name."
             )
 
-            if ShieldCls is None:
-                raise ImportError(
-                    "Could not find a shield class in src/safety.py. "
-                    "Tried: SafetyShield, Shield, SafetyLayer, MPCShield. "
-                    "Run: python -c \"import src.safety as s; print([n for n in dir(s) if 'hield' in n.lower()])\" "
-                    "and then update SafetyShieldWrapper to use the correct name."
-                )
-
+        # Instantiate with the MPCLikeSafetyShield signature
+        if chosen == "MPCLikeSafetyShield":
+            self.shield = shield_cls(
+                params=self.params,
+                action_space_type=self.action_space_type,
+                no_mpc=self.no_mpc,
+                no_conformal=self.no_conformal,
+                calibrator=self.calibrator,
+            )
+        else:
+            # Best-effort legacy instantiation
             try:
-                self.shield = ShieldCls(
-                    params=params,
-                    action_space_type=action_space_type,
-                    no_mpc=no_mpc,
-                    no_conformal=no_conformal,
-                    calibrator=calibrator,
+                self.shield = shield_cls(
+                    params=self.params,
+                    action_space_type=self.action_space_type,
+                    no_mpc=self.no_mpc,
+                    no_conformal=self.no_conformal,
+                    calibrator=self.calibrator,
                 )
             except TypeError:
-                # Fallback: try positional args
-                self.shield = ShieldCls(params, action_space_type, no_mpc, no_conformal, calibrator)
+                self.shield = shield_cls(self.params)
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
 
     def step(self, action):
-        shield_used = False
-        shield_reason = ""
-        proposed_action = action
+        cur_ctx_id = getattr(self.env, "cur_ctx_id", 0)
+        try:
+            cur_ctx_id = int(cur_ctx_id)
+        except Exception:
+            cur_ctx_id = 0
 
-        if self.shield is not None:
+        safe_action, shield_info = self.shield.filter_action(self.env, action, cur_ctx_id=cur_ctx_id)
+
+        obs, reward, terminated, truncated, info = self.env.step(safe_action)
+
+        # Update calibrator with a simple, robust clearance shortfall signal
+        if (self.calibrator is not None) and (not self.no_conformal):
             try:
-                # shield.filter_action(env, action) -> (safe_action, used, reason)
-                proposed_action, shield_used, shield_reason = self.shield.filter_action(self.env, action)  # type: ignore[attr-defined]
+                d = clearance_margin(self.env, self.params)
+                if np.isfinite(d):
+                    err = max(0.0, float(self.params.epsilon - d))
+                    self.calibrator.update(err)
             except Exception:
-                try:
-                    # shield(action=..., env=...) -> dict with "action"/"shield_used"/"shield_reason"
-                    out = self.shield(action=action, env=self.env)  # type: ignore[misc]
-                    proposed_action = out.get("action", action)
-                    shield_used = bool(out.get("shield_used", False))
-                    shield_reason = str(out.get("shield_reason", ""))
-                except Exception:
-                    proposed_action = action
-                    shield_used = False
-                    shield_reason = "shield_error_fallback"
+                pass
 
-        obs, reward, terminated, truncated, info = self.env.step(proposed_action)
-
-        info = dict(info) if info is not None else {}
-        info["shield_used"] = bool(shield_used)
-        info["shield_reason"] = shield_reason
-
-        # --- Define safety violation signal ---
-        # highway-env commonly uses "crashed" (boolean) to indicate a collision.
-        crashed = bool(info.get("crashed", False) or info.get("collision", False))
-        info["violation"] = crashed
-
-        # Keep near_miss key stable for logging/plots; define later if desired.
-        info.setdefault("near_miss", False)
+        if isinstance(info, dict):
+            info = dict(info)
+            if isinstance(shield_info, dict):
+                for k, v in shield_info.items():
+                    info[f"shield/{k}"] = v
+            # simple flag
+            if self.action_space_type == "discrete":
+                info["shield/filtered"] = (safe_action != action)
+            else:
+                info["shield/filtered"] = (safe_action is not action)
 
         return obs, reward, terminated, truncated, info
-
-
-class FixedKinematicsObsWrapper(gym.ObservationWrapper):
-    """
-    Force a fixed (K, F) observation by truncating/padding on the first axis.
-
-    This solves SB3 buffer mismatch when highway-env returns different (N, F)
-    depending on config/context (e.g., merge defaults to 5 vehicles but contexts use 10).
-    """
-
-    def __init__(self, env: gym.Env, K: int = 10):
-        super().__init__(env)
-        self.K = int(K)
-
-        space = env.observation_space
-        if not isinstance(space, gym.spaces.Box) or len(space.shape) != 2:
-            raise TypeError(f"Expected Box((N,F)) obs space, got {space}")
-
-        _, F = space.shape
-        self.F = int(F)
-
-        low = np.full((self.K, self.F), -np.inf, dtype=space.dtype)
-        high = np.full((self.K, self.F), np.inf, dtype=space.dtype)
-
-        self.observation_space = gym.spaces.Box(
-            low=low, high=high, shape=(self.K, self.F), dtype=space.dtype
-        )
-
-    def observation(self, observation):
-        obs = np.asarray(observation)
-        if obs.ndim != 2:
-            return obs
-
-        N, F = obs.shape
-        out = np.zeros((self.K, F), dtype=np.float32)
-
-        ncopy = min(N, self.K)
-        out[:ncopy] = obs[:ncopy].astype(np.float32, copy=False)
-        return out
