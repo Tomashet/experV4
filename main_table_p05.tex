@@ -1,0 +1,20 @@
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llccc}
+\toprule
+Algorithm & Setting & Safety & Violation rate $\downarrow$ & Return $\uparrow$ \\
+\midrule
+DQN & nonstationary ($p_{\mathrm{stay}}=0.85$) & off & 1.16\% & 13.856 \\
+DQN & nonstationary ($p_{\mathrm{stay}}=0.85$) & on & 0.00\% & 13.926 \\
+DQN & stationary ($p_{\mathrm{stay}}=1.00$) & off & 1.00\% & 13.856 \\
+DQN & stationary ($p_{\mathrm{stay}}=1.00$) & on & 0.00\% & 13.926 \\
+PPO & nonstationary ($p_{\mathrm{stay}}=0.85$) & off & 0.58\% & 14.421 \\
+PPO & nonstationary ($p_{\mathrm{stay}}=0.85$) & on & 0.00\% & 13.934 \\
+PPO & stationary ($p_{\mathrm{stay}}=1.00$) & off & 0.53\% & 14.421 \\
+PPO & stationary ($p_{\mathrm{stay}}=1.00$) & on & 0.00\% & 13.934 \\
+\bottomrule
+\end{tabular}
+\caption{Training-time comparison across algorithms, dynamics regimes, and safety settings. Violation rate is computed from train\_monitor logs and reported as a percentage. Return is the mean of the final 10\% of reward checkpoints, averaged over seeds.}
+\label{tab:main_results_compare}
+\end{table}

@@ -1,0 +1,18 @@
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lllccl}
+\toprule
+Condition & Algo & Safe & Return $\uparrow$ & Violation $\downarrow$ \\
+\midrule
+nonstationary & DQN & off & 15.0 $\pm$ 0.3 & 2.23\% $\pm$ 0.23\% \
+nonstationary & PPO & off & 16.1 $\pm$ 0.0 & 1.15\% $\pm$ 0.02\% \
+nonstationary & SAC & off & 22.0 $\pm$ 16.0 & 0.00\% $\pm$ 0.00\% \
+stationary & DQN & off & 15.2 $\pm$ 0.4 & 1.94\% $\pm$ 0.16\% \
+stationary & PPO & off & 16.2 $\pm$ 0.0 & 1.06\% $\pm$ 0.01\% \
+stationary & SAC & off & 39.7 $\pm$ 17.7 & 0.00\% $\pm$ 0.00\% \
+\bottomrule
+\end{tabular}
+\caption{Final performance (mean $\pm$ s.e. over seeds). Return is the average of the last 10\% of training checkpoints; Violation is the episode violation rate (or per-step rate if episode IDs are unavailable).}
+\label{tab:main_results}
+\end{table}
